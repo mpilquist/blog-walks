@@ -60,10 +60,10 @@ def totalSize(dir: Path): IO[Long] =
 
 ```scala
 def scalaLinesIn(dir: Path): IO[Long] =
-	Files[IO].walk(dir)
-	  .filter(_.extName == ".scala")
-	  .evalMap(lineCount)
-	  .compile.foldMonoid
+  Files[IO].walk(dir)
+    .filter(_.extName == ".scala")
+    .evalMap(lineCount)
+    .compile.foldMonoid
 ```
 
 The `walk` function supports a lot of additional functionality like limiting the depth of the traversal and following symbolic links. Let's reimplement 
@@ -92,7 +92,6 @@ import cats.syntax.all.*
 def makeLargeDir: IO[Path] =
   Files[IO].createTempDirectory.flatMap:
     dir =>
-
       val MaxDepth = 7
       val Names = 'A'.to('E').toList.map(_.toString)
 
@@ -113,7 +112,7 @@ def makeLargeDir: IO[Path] =
 
 import cats.effect.unsafe.implicits.global
 val largeDir = makeLargeDir.unsafeRunSync() 
-// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/12826854411176836357
+// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/17960056301335785752
 ```
 
 And then let's walk it, counting the members and measuring how long it takes.
@@ -128,14 +127,14 @@ def time[A](f: => A): (FiniteDuration, A) =
   (elapsed, result)
 
 println(time(Files[IO].walk(largeDir).compile.count.unsafeRunSync()))
-// (25538 milliseconds,488281)
+// (26622 milliseconds,488281)
 ```
 
 Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 
 ```scala
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
-// (5484 milliseconds,488281)
+// (5679 milliseconds,488281)
 ```
 
 About five times slower! What can we do to improve this? Let's take a look at some options.
@@ -161,18 +160,13 @@ This implementation converts the Java stream returned by `JFiles.walk` to an `fs
 Let's see how this performs:
 ```scala
 println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
-// (14796 milliseconds,488281)
+// (14776 milliseconds,488281)
 
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6027 milliseconds,488281)
+// (5916 milliseconds,488281)
 ```
 
-Even with a chunk size of 1, this implementation is nearly twice as fast. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly. Let's see what happens when we use `Int.MaxValue` as the chunk size:
-
-```scala
-println(time(jwalk[IO](largeDir, Int.MaxValue).compile.count.unsafeRunSync()))
-// (225236 milliseconds,488281)
-```
+Even with a chunk size of 1, this implementation is nearly twice as fast. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
 
 ## Optimization 2: Using j.n.f.Files.walkFileTree 
 

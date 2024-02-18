@@ -60,10 +60,10 @@ def totalSize(dir: Path): IO[Long] =
 
 ```scala mdoc
 def scalaLinesIn(dir: Path): IO[Long] =
-	Files[IO].walk(dir)
-	  .filter(_.extName == ".scala")
-	  .evalMap(lineCount)
-	  .compile.foldMonoid
+  Files[IO].walk(dir)
+    .filter(_.extName == ".scala")
+    .evalMap(lineCount)
+    .compile.foldMonoid
 ```
 
 The `walk` function supports a lot of additional functionality like limiting the depth of the traversal and following symbolic links. Let's reimplement 
@@ -92,7 +92,6 @@ import cats.syntax.all.*
 def makeLargeDir: IO[Path] =
   Files[IO].createTempDirectory.flatMap:
     dir =>
-
       val MaxDepth = 7
       val Names = 'A'.to('E').toList.map(_.toString)
 
@@ -162,11 +161,7 @@ println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
 ```
 
-Even with a chunk size of 1, this implementation is nearly twice as fast. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly. Let's see what happens when we use `Int.MaxValue` as the chunk size:
-
-```scala mdoc
-println(time(jwalk[IO](largeDir, Int.MaxValue).compile.count.unsafeRunSync()))
-```
+Even with a chunk size of 1, this implementation is nearly twice as fast. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
 
 ## Optimization 2: Using j.n.f.Files.walkFileTree 
 
