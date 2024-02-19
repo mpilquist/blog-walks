@@ -112,7 +112,7 @@ def makeLargeDir: IO[Path] =
 
 import cats.effect.unsafe.implicits.global
 val largeDir = makeLargeDir.unsafeRunSync() 
-// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/13067206020062938958
+// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/9951157556051823633
 ```
 
 And then let's walk it, counting the members and measuring how long it takes.
@@ -127,14 +127,14 @@ def time[A](f: => A): (FiniteDuration, A) =
   (elapsed, result)
 
 println(time(Files[IO].walk(largeDir).compile.count.unsafeRunSync()))
-// (26602 milliseconds,488281)
+// (26236 milliseconds,488281)
 ```
 
 Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 
 ```scala
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
-// (5644 milliseconds,488281)
+// (5598 milliseconds,488281)
 ```
 
 About five times slower! What can we do to improve this? Let's take a look at some options.
@@ -160,10 +160,10 @@ This implementation converts the Java stream returned by `JFiles.walk` to an `fs
 Let's see how this performs:
 ```scala
 println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
-// (15432 milliseconds,488281)
+// (14997 milliseconds,488281)
 
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6028 milliseconds,488281)
+// (6065 milliseconds,488281)
 ```
 
 Even with a chunk size of 1, this implementation is nearly twice as fast as the original implementation. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
@@ -216,7 +216,7 @@ This performs fairly well:
 
 ```scala
 println(time(walkEager[IO](largeDir).compile.count.unsafeRunSync()))
-// (5931 milliseconds,488281)
+// (5868 milliseconds,488281)
 ```
 
 Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront, before emitting anything.
@@ -273,10 +273,69 @@ def walkLazy[F[_]: Async](start: Path, chunkSize: Int): Stream[F, Path] =
 
 ```scala
 println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6072 milliseconds,488281)
+// (6135 milliseconds,488281)
 ```
 
 ## Optimization 4: Custom traversal
+
+```scala
+def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
+  import scala.collection.immutable.Queue
+  import scala.util.control.NonFatal
+  import scala.util.Using
+  import java.nio.file.{Files as JFiles, LinkOption}
+  import java.nio.file.attribute.{BasicFileAttributes as JBasicFileAttributes}
+
+  case class WalkEntry(
+      path: Path,
+      attr: JBasicFileAttributes
+  )
+
+  def loop(toWalk0: Queue[WalkEntry]): Stream[F, Path] =
+    val partialWalk = Sync[F].interruptible:
+      var acc = Vector.empty[Path]
+      var toWalk = toWalk0
+
+      while acc.size < chunkSize && toWalk.nonEmpty && !Thread.interrupted() do
+        val entry = toWalk.head
+        toWalk = toWalk.drop(1)
+        acc = acc :+ entry.path
+        if entry.attr.isDirectory then
+          Using(JFiles.list(entry.path.toNioPath)):
+            listing =>
+              val descendants = listing.iterator.asScala.flatMap:
+                p =>
+                  try
+                    val attr =
+                      JFiles.readAttributes(
+                        p,
+                        classOf[JBasicFileAttributes],
+                        LinkOption.NOFOLLOW_LINKS
+                      )
+                    Some(WalkEntry(Path.fromNioPath(p), attr))
+                  catch case NonFatal(_) => None
+              toWalk = Queue.empty ++ descendants ++ toWalk
+
+      Stream.chunk(Chunk.from(acc)) ++ (if toWalk.isEmpty then Stream.empty else loop(toWalk))
+
+    Stream.eval(partialWalk).flatten
+
+  Stream
+    .eval(Sync[F].interruptible:
+      WalkEntry(
+        start,
+        JFiles.readAttributes(start.toNioPath, classOf[JBasicFileAttributes])
+      )
+    )
+    .mask
+    .flatMap(w => loop(Queue(w)))
+```
+
+```scala
+println(time(walkJustInTime[IO](largeDir, 1024).compile.count.unsafeRunSync()))
+// (6076 milliseconds,488281)
+```
+
 
 ## Conclusion
 

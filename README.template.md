@@ -271,5 +271,63 @@ println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
 
 ## Optimization 4: Custom traversal
 
+```scala mdoc
+def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
+  import scala.collection.immutable.Queue
+  import scala.util.control.NonFatal
+  import scala.util.Using
+  import java.nio.file.{Files as JFiles, LinkOption}
+  import java.nio.file.attribute.{BasicFileAttributes as JBasicFileAttributes}
+
+  case class WalkEntry(
+      path: Path,
+      attr: JBasicFileAttributes
+  )
+
+  def loop(toWalk0: Queue[WalkEntry]): Stream[F, Path] =
+    val partialWalk = Sync[F].interruptible:
+      var acc = Vector.empty[Path]
+      var toWalk = toWalk0
+
+      while acc.size < chunkSize && toWalk.nonEmpty && !Thread.interrupted() do
+        val entry = toWalk.head
+        toWalk = toWalk.drop(1)
+        acc = acc :+ entry.path
+        if entry.attr.isDirectory then
+          Using(JFiles.list(entry.path.toNioPath)):
+            listing =>
+              val descendants = listing.iterator.asScala.flatMap:
+                p =>
+                  try
+                    val attr =
+                      JFiles.readAttributes(
+                        p,
+                        classOf[JBasicFileAttributes],
+                        LinkOption.NOFOLLOW_LINKS
+                      )
+                    Some(WalkEntry(Path.fromNioPath(p), attr))
+                  catch case NonFatal(_) => None
+              toWalk = Queue.empty ++ descendants ++ toWalk
+
+      Stream.chunk(Chunk.from(acc)) ++ (if toWalk.isEmpty then Stream.empty else loop(toWalk))
+
+    Stream.eval(partialWalk).flatten
+
+  Stream
+    .eval(Sync[F].interruptible:
+      WalkEntry(
+        start,
+        JFiles.readAttributes(start.toNioPath, classOf[JBasicFileAttributes])
+      )
+    )
+    .mask
+    .flatMap(w => loop(Queue(w)))
+```
+
+```scala mdoc
+println(time(walkJustInTime[IO](largeDir, 1024).compile.count.unsafeRunSync()))
+```
+
+
 ## Conclusion
 
