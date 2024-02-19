@@ -112,7 +112,7 @@ def makeLargeDir: IO[Path] =
 
 import cats.effect.unsafe.implicits.global
 val largeDir = makeLargeDir.unsafeRunSync() 
-// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/9951157556051823633
+// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/7398222013073991902
 ```
 
 And then let's walk it, counting the members and measuring how long it takes.
@@ -127,14 +127,14 @@ def time[A](f: => A): (FiniteDuration, A) =
   (elapsed, result)
 
 println(time(Files[IO].walk(largeDir).compile.count.unsafeRunSync()))
-// (26236 milliseconds,488281)
+// (28774 milliseconds,488281)
 ```
 
 Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 
 ```scala
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
-// (5598 milliseconds,488281)
+// (5844 milliseconds,488281)
 ```
 
 About five times slower! What can we do to improve this? Let's take a look at some options.
@@ -160,10 +160,10 @@ This implementation converts the Java stream returned by `JFiles.walk` to an `fs
 Let's see how this performs:
 ```scala
 println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
-// (14997 milliseconds,488281)
+// (15414 milliseconds,488281)
 
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6065 milliseconds,488281)
+// (6002 milliseconds,488281)
 ```
 
 Even with a chunk size of 1, this implementation is nearly twice as fast as the original implementation. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
@@ -216,12 +216,14 @@ This performs fairly well:
 
 ```scala
 println(time(walkEager[IO](largeDir).compile.count.unsafeRunSync()))
-// (5868 milliseconds,488281)
+// (5897 milliseconds,488281)
 ```
 
 Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront, before emitting anything.
 
 ## Optimization 3: Using j.n.f.Files.walkFileTree lazily
+
+The `walkFileTree` operation doesn't allow us to suspend the traversal after we've accumulated some results. The best we can do is to block on enqueuing until our down-stream processing is ready for more elements. We can implement this by introducing concurrency. The general idea is to create a `fs2.concurrent.Channel` and return a `Stream[F, Path]` based on the elements sent to that channel. While down-stream pulls on that stream, concurrently evaluate the walk sending a chunk of paths to the channel as they are accumulated.
 
 ```scala
 import cats.effect.Async
@@ -268,12 +270,20 @@ def walkLazy[F[_]: Async](start: Path, chunkSize: Int): Stream[F, Path] =
     dispatcher =>
       Stream.eval(Channel.synchronous[F, Chunk[Path]]).flatMap:
         channel =>
-          channel.stream.concurrently(Stream.eval(doWalk(dispatcher, channel))).flatMap(Stream.chunk)
+          channel.stream.flatMap(Stream.chunk).concurrently(Stream.eval(doWalk(dispatcher, channel)))
 ```
+
+The `enqueue` method handles sending an accumulated chunk to the channel upon reaching the desired chunk size. The `channel.send` operation returns an `IO[Either[Channel.Closed, Unit]]`. We need to run that value from within the visitor callback to ensure we backpressure the walk. We do that by using a `cats.effect.std.Dispatcher` and calling `unsafeRunSync`.
+
+When the traversal completes, we might have some enqueued paths that need to be sent to the channel. We send a final chunk to the channel and close it via `channel.closeWithElement`.
+
+The main body of `walkLazy` allocates a dispatcher and channel and then returns a stream from the channel while concurrently evaluating the walk.
+
+Let's check performance:
 
 ```scala
 println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6135 milliseconds,488281)
+// (6216 milliseconds,488281)
 ```
 
 ## Optimization 4: Custom traversal
@@ -333,7 +343,7 @@ def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
 
 ```scala
 println(time(walkJustInTime[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6076 milliseconds,488281)
+// (6051 milliseconds,488281)
 ```
 
 

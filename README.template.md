@@ -217,6 +217,8 @@ Despite the performance, this implementation isn't sufficient for general use. W
 
 ## Optimization 3: Using j.n.f.Files.walkFileTree lazily
 
+The `walkFileTree` operation doesn't allow us to suspend the traversal after we've accumulated some results. The best we can do is to block on enqueuing until our down-stream processing is ready for more elements. We can implement this by introducing concurrency. The general idea is to create a `fs2.concurrent.Channel` and return a `Stream[F, Path]` based on the elements sent to that channel. While down-stream pulls on that stream, concurrently evaluate the walk sending a chunk of paths to the channel as they are accumulated.
+
 ```scala mdoc
 import cats.effect.Async
 
@@ -262,8 +264,16 @@ def walkLazy[F[_]: Async](start: Path, chunkSize: Int): Stream[F, Path] =
     dispatcher =>
       Stream.eval(Channel.synchronous[F, Chunk[Path]]).flatMap:
         channel =>
-          channel.stream.concurrently(Stream.eval(doWalk(dispatcher, channel))).flatMap(Stream.chunk)
+          channel.stream.flatMap(Stream.chunk).concurrently(Stream.eval(doWalk(dispatcher, channel)))
 ```
+
+The `enqueue` method handles sending an accumulated chunk to the channel upon reaching the desired chunk size. The `channel.send` operation returns an `IO[Either[Channel.Closed, Unit]]`. We need to run that value from within the visitor callback to ensure we backpressure the walk. We do that by using a `cats.effect.std.Dispatcher` and calling `unsafeRunSync`.
+
+When the traversal completes, we might have some enqueued paths that need to be sent to the channel. We send a final chunk to the channel and close it via `channel.closeWithElement`.
+
+The main body of `walkLazy` allocates a dispatcher and channel and then returns a stream from the channel while concurrently evaluating the walk.
+
+Let's check performance:
 
 ```scala mdoc
 println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
