@@ -161,11 +161,113 @@ println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
 ```
 
-Even with a chunk size of 1, this implementation is nearly twice as fast. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
+Even with a chunk size of 1, this implementation is nearly twice as fast as the original implementation. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
 
-## Optimization 2: Using j.n.f.Files.walkFileTree 
+Problem solved? Not quite. Unfortunately, `JFiles.walk` has a major limitation - [it provides no mechanism to handle exceptions while iterating](https://bugs.openjdk.org/browse/JDK-8039910). [Common wisdom](https://stackoverflow.com/questions/22867286/files-walk-calculate-total-size) is to use `JFiles.walkFileTree` instead. 
 
-## Optimization 3: Using j.n.f.Files.walkFileTree eagerly
+## Optimization 2: Using j.n.f.Files.walkFileTree
+
+The `walkFileTree` function inverts control of the iteration -- it takes a `FileVisitor[Path]`, which provides callbacks like `visitFile` and `preVisitDirectory`. The simplest possible implementation is passing a `FileVisitor` that enqueues each visited file and directory in to a collection and upon termination, emits all collected entries as a single chunk.
+
+
+```scala mdoc
+import fs2.Chunk
+
+def walkEager[F[_]: Sync](start: Path): Stream[F, Path] =
+  import java.io.IOException
+  import java.nio.file.{Files as JFiles, FileVisitor, FileVisitResult, Path as JPath}
+  import java.nio.file.attribute.{BasicFileAttributes as JBasicFileAttributes}
+
+  val doWalk = Sync[F].interruptible:
+    val bldr = Vector.newBuilder[Path]
+    JFiles.walkFileTree(
+      start.toNioPath,
+      new FileVisitor[JPath]:
+        private def enqueue(path: JPath, attrs: JBasicFileAttributes): FileVisitResult =
+          bldr += Path.fromNioPath(path)
+          FileVisitResult.CONTINUE
+
+        override def visitFile(file: JPath, attrs: JBasicFileAttributes): FileVisitResult =
+          if Thread.interrupted() then FileVisitResult.TERMINATE else enqueue(file, attrs)
+
+        override def visitFileFailed(file: JPath, t: IOException): FileVisitResult =
+          FileVisitResult.CONTINUE
+
+        override def preVisitDirectory(dir: JPath, attrs: JBasicFileAttributes): FileVisitResult =
+          if Thread.interrupted() then FileVisitResult.TERMINATE else enqueue(dir, attrs)
+
+        override def postVisitDirectory(dir: JPath, t: IOException): FileVisitResult =
+          if Thread.interrupted() then FileVisitResult.TERMINATE else FileVisitResult.CONTINUE
+    )
+
+    Chunk.from(bldr.result())
+
+  Stream.eval(doWalk).flatMap(Stream.chunk)
+```
+
+The implementation wraps the call to `walkFileTree` with `Sync[F].interruptible`, allowing cancellation of the fiber that executes the walk. The `FileVisitor` simply enqueus files and directories while checking the `Thread.interrupted()` flag.
+
+This performs fairly well:
+
+```scala mdoc
+println(time(walkEager[IO](largeDir).compile.count.unsafeRunSync()))
+```
+
+Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront, before emitting anything.
+
+## Optimization 3: Using j.n.f.Files.walkFileTree lazily
+
+```scala mdoc
+import cats.effect.Async
+
+def walkLazy[F[_]: Async](start: Path, chunkSize: Int): Stream[F, Path] =
+  import java.io.IOException
+  import java.nio.file.{Files as JFiles, FileVisitor, FileVisitResult, Path as JPath}
+  import java.nio.file.attribute.{BasicFileAttributes as JBasicFileAttributes}
+
+  import cats.effect.std.Dispatcher
+  import fs2.concurrent.Channel
+
+  def doWalk(dispatcher: Dispatcher[F], channel: Channel[F, Chunk[Path]]) = Sync[F].interruptible:
+    val bldr = Vector.newBuilder[Path]
+    var size = 0
+    JFiles.walkFileTree(
+      start.toNioPath,
+      new FileVisitor[JPath]:
+        private def enqueue(path: JPath, attrs: JBasicFileAttributes): FileVisitResult =
+          bldr += Path.fromNioPath(path)
+          size += 1
+          if size >= chunkSize then
+            val result = dispatcher.unsafeRunSync(channel.send(Chunk.from(bldr.result())))
+            bldr.clear()
+            size = 0
+            if result.isLeft then FileVisitResult.TERMINATE else FileVisitResult.CONTINUE
+          else FileVisitResult.CONTINUE
+
+        override def visitFile(file: JPath, attrs: JBasicFileAttributes): FileVisitResult =
+          if Thread.interrupted() then FileVisitResult.TERMINATE else enqueue(file, attrs)
+
+        override def visitFileFailed(file: JPath, t: IOException): FileVisitResult =
+          FileVisitResult.CONTINUE
+
+        override def preVisitDirectory(dir: JPath, attrs: JBasicFileAttributes): FileVisitResult =
+          if Thread.interrupted() then FileVisitResult.TERMINATE else enqueue(dir, attrs)
+
+        override def postVisitDirectory(dir: JPath, t: IOException): FileVisitResult =
+          if Thread.interrupted() then FileVisitResult.TERMINATE else FileVisitResult.CONTINUE
+    )
+    dispatcher.unsafeRunSync(channel.closeWithElement(Chunk.from(bldr.result())))
+
+  Stream.resource(Dispatcher.sequential[F]).flatMap:
+    dispatcher =>
+      Stream.eval(Channel.synchronous[F, Chunk[Path]]).flatMap:
+        channel =>
+          channel.stream.concurrently(Stream.eval(doWalk(dispatcher, channel))).flatMap(Stream.chunk)
+```
+
+```scala mdoc
+println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
+```
 
 ## Optimization 4: Custom traversal
 
