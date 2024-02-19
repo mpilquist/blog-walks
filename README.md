@@ -112,7 +112,7 @@ def makeLargeDir: IO[Path] =
 
 import cats.effect.unsafe.implicits.global
 val largeDir = makeLargeDir.unsafeRunSync() 
-// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/7398222013073991902
+// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/11099991040943311256
 ```
 
 And then let's walk it, counting the members and measuring how long it takes.
@@ -127,14 +127,14 @@ def time[A](f: => A): (FiniteDuration, A) =
   (elapsed, result)
 
 println(time(Files[IO].walk(largeDir).compile.count.unsafeRunSync()))
-// (28774 milliseconds,488281)
+// (26111 milliseconds,488281)
 ```
 
 Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 
 ```scala
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
-// (5844 milliseconds,488281)
+// (5595 milliseconds,488281)
 ```
 
 About five times slower! What can we do to improve this? Let's take a look at some options.
@@ -160,10 +160,10 @@ This implementation converts the Java stream returned by `JFiles.walk` to an `fs
 Let's see how this performs:
 ```scala
 println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
-// (15414 milliseconds,488281)
+// (14368 milliseconds,488281)
 
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6002 milliseconds,488281)
+// (5993 milliseconds,488281)
 ```
 
 Even with a chunk size of 1, this implementation is nearly twice as fast as the original implementation. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
@@ -216,7 +216,7 @@ This performs fairly well:
 
 ```scala
 println(time(walkEager[IO](largeDir).compile.count.unsafeRunSync()))
-// (5897 milliseconds,488281)
+// (5914 milliseconds,488281)
 ```
 
 Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront, before emitting anything.
@@ -283,10 +283,16 @@ Let's check performance:
 
 ```scala
 println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6216 milliseconds,488281)
+// (6201 milliseconds,488281)
 ```
 
+This performs pretty well despite the concurrency. There's another problem though -- this technique doesn't work on Scala Native, where there's no `unsafeRunSync` operation on `Dispatcher`. And requiring concurrency seems conceptually heavyweight for a file system traversal, even if performance is sufficient.
+
 ## Optimization 4: Custom traversal
+
+Let's abandon `walkFileTree` and instead implement the traversal ourselves. This will provide us the most flexibility, allowing us to accumulate paths up to a desired chunk size and then yielding control back to down-stream processing.
+
+To do so, we'll need to maintain a collection of paths left to walk. We can then use the laziness of the `++` operation on `Stream` to suspend the walk between chunks, similar to our very first prototype implementation `walkSimple`. 
 
 ```scala
 def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
@@ -341,9 +347,13 @@ def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
     .flatMap(w => loop(Queue(w)))
 ```
 
+The heart of this implementatin is the recursive `loop` function, which uses a single `Sync[F].interruptible` block to accumulate paths up to the specified chunk size, while maintaining a queue of paths left to walk. Upon reaching the chunk size, the accumulated paths are emitted and `loop` is called recursively with the remaining paths left to walk.
+
+Let's check performance:
+
 ```scala
 println(time(walkJustInTime[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6051 milliseconds,488281)
+// (6129 milliseconds,488281)
 ```
 
 

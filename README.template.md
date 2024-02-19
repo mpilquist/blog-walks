@@ -279,7 +279,13 @@ Let's check performance:
 println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
 ```
 
+This performs pretty well despite the concurrency. There's another problem though -- this technique doesn't work on Scala Native, where there's no `unsafeRunSync` operation on `Dispatcher`. And requiring concurrency seems conceptually heavyweight for a file system traversal, even if performance is sufficient.
+
 ## Optimization 4: Custom traversal
+
+Let's abandon `walkFileTree` and instead implement the traversal ourselves. This will provide us the most flexibility, allowing us to accumulate paths up to a desired chunk size and then yielding control back to down-stream processing.
+
+To do so, we'll need to maintain a collection of paths left to walk. We can then use the laziness of the `++` operation on `Stream` to suspend the walk between chunks, similar to our very first prototype implementation `walkSimple`. 
 
 ```scala mdoc
 def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
@@ -333,6 +339,10 @@ def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
     .mask
     .flatMap(w => loop(Queue(w)))
 ```
+
+The heart of this implementatin is the recursive `loop` function, which uses a single `Sync[F].interruptible` block to accumulate paths up to the specified chunk size, while maintaining a queue of paths left to walk. Upon reaching the chunk size, the accumulated paths are emitted and `loop` is called recursively with the remaining paths left to walk.
+
+Let's check performance:
 
 ```scala mdoc
 println(time(walkJustInTime[IO](largeDir, 1024).compile.count.unsafeRunSync()))
