@@ -2,14 +2,14 @@
 
 The [fs2-io](https://fs2.io/#/io) library provides support for working with files in a functional way. It provides a single API that works on the JVM, Scala.js, and Scala Native.
 
-As a first exapmle, consider counting the number of lines in a text file:
+As a first example, consider counting the number of lines in a text file:
 
 ```scala mdoc
 import fs2.io.file.{Files, Path}
 import cats.effect.IO
 
 def lineCount(p: Path): IO[Long] =
-	Files[IO].readUtf8Lines(p).mask.compile.count
+  Files[IO].readUtf8Lines(p).mask.compile.count
 ```
 
 The `lineCount` function uses takes the path of a file to read and returns the number of lines in that file. It uses the `readUtf8Lines` function from `Files[IO]`, which returns a `Stream[IO, String]`. Each value emitted from that stream is a separate line from the source file. The `mask` operation ignores any errors and `compile.count` converts the streaming computation to a single value by counting the number of output elements.
