@@ -66,7 +66,7 @@ def scalaLinesIn(dir: Path): IO[Long] =
     .compile.foldMonoid
 ```
 
-The `walk` function supports a lot of additional functionality like limiting the depth of the traversal and following symbolic links. Let's reimplement 
+The `walk` function supports a lot of additional functionality like limiting the depth of the traversal and following symbolic links. Let's reimplement `walk`, focusing on just the core functionality. 
 
 ```scala mdoc
 import fs2.Stream
