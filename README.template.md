@@ -80,7 +80,7 @@ def walkSimple[F[_]: Files](start: Path): Stream[F, Path] =
     Stream.emit(start) ++ next
 ```
 
-This implementation uses two lower level operations from `Files` -- `getBasicFileAttributes` and `list`. The `getBasicFileAttributes` operation is used to determine if the current path is a directory, and if so, the `list` operation is used to get the direct descendants of the directory and we recursively walk each descendant. Stack safety and early termination are both provided by `Stream`. The `mask` operation is used after both file system operations to turn errors in to empty streams, resulting in a lenient walk -- for example, if we don't have permissions to read a file or a file is deleted while we're traversing, we just continue walking.
+This implementation uses two lower level operations from `Files` -- `getBasicFileAttributes` and `list`. The `getBasicFileAttributes` operation is used to determine if the current path is a directory, and if so, the `list` operation is used to get the direct descendants of the directory allowing us to recursively walk each descendant. Stack safety and early termination are both provided by `Stream`. The `mask` operation is used after both file system operations to turn errors in to empty streams, resulting in a lenient walk -- for example, if we don't have permissions to read a file or a file is deleted while we're traversing, we just continue walking.
 
 ## Performance
 
@@ -134,7 +134,7 @@ Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
 ```
 
-About five times slower! Presumably because of the overhead of the Cats Effect interpreter and the number of small, blocking calls we're making. There are 390,625 files in this tree and 97,656 directories. That's 390,625 + 97,656 = 488,281 calls to `getBasicFileAttributes` and 97,656 calls to `list`, totaling 585,937 total blocking calls.
+About four to five times slower (depending on run to run variance)! Presumably because of the overhead of the Cats Effect interpreter and the number of small, blocking calls we're making. There are 390,625 files in this tree and 97,656 directories. That's 390,625 + 97,656 = 488,281 calls to `getBasicFileAttributes` and 97,656 calls to `list`, totaling 585,937 total blocking calls.
 
 What can we do to improve this? Let's take a look at some options.
 
