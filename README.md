@@ -112,7 +112,7 @@ def makeLargeDir: IO[Path] =
 
 import cats.effect.unsafe.implicits.global
 val largeDir = makeLargeDir.unsafeRunSync() 
-// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/11099991040943311256
+// largeDir: Path = /var/folders/q4/tm2l78qj6zq0x4_7hrlpckcm0000gn/T/2584656294953153819
 ```
 
 And then let's walk it, counting the members and measuring how long it takes.
@@ -126,18 +126,20 @@ def time[A](f: => A): (FiniteDuration, A) =
   val elapsed = (System.currentTimeMillis - start).millis
   (elapsed, result)
 
-println(time(Files[IO].walk(largeDir).compile.count.unsafeRunSync()))
-// (26111 milliseconds,488281)
+println(time(walkSimple[IO](largeDir).compile.count.unsafeRunSync()))
+// (25578 milliseconds,488281)
 ```
 
 Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 
 ```scala
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
-// (5595 milliseconds,488281)
+// (5629 milliseconds,488281)
 ```
 
-About five times slower! What can we do to improve this? Let's take a look at some options.
+About five times slower! Presumably because of the overhead of the Cats Effect interpreter and the number of small, blocking calls we're making. There are 390,625 files in this tree and 97,656 directories. That's 390,625 + 97,656 = 488,281 calls to `getBasicFileAttributes` and 97,656 calls to `list`, totaling 585,937 total blocking calls.
+
+What can we do to improve this? Let's take a look at some options.
 
 ## Optimization 1: Using j.n.f.Files.walk
 
@@ -160,10 +162,10 @@ This implementation converts the Java stream returned by `JFiles.walk` to an `fs
 Let's see how this performs:
 ```scala
 println(time(jwalk[IO](largeDir, 1).compile.count.unsafeRunSync()))
-// (14368 milliseconds,488281)
+// (14912 milliseconds,488281)
 
 println(time(jwalk[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (5993 milliseconds,488281)
+// (5970 milliseconds,488281)
 ```
 
 Even with a chunk size of 1, this implementation is nearly twice as fast as the original implementation. With a large chunk size, this implementation approaches the performance of using `JFiles.walk` directly.
@@ -216,7 +218,7 @@ This performs fairly well:
 
 ```scala
 println(time(walkEager[IO](largeDir).compile.count.unsafeRunSync()))
-// (5914 milliseconds,488281)
+// (5886 milliseconds,488281)
 ```
 
 Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront, before emitting anything.
@@ -283,7 +285,7 @@ Let's check performance:
 
 ```scala
 println(time(walkLazy[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6201 milliseconds,488281)
+// (6192 milliseconds,488281)
 ```
 
 This performs pretty well despite the concurrency. There's another problem though -- this technique doesn't work on Scala Native, where there's no `unsafeRunSync` operation on `Dispatcher`. And requiring concurrency seems conceptually heavyweight for a file system traversal, even if performance is sufficient.
@@ -347,15 +349,61 @@ def walkJustInTime[F[_]: Sync](start: Path, chunkSize: Int): Stream[F, Path] =
     .flatMap(w => loop(Queue(w)))
 ```
 
-The heart of this implementatin is the recursive `loop` function, which uses a single `Sync[F].interruptible` block to accumulate paths up to the specified chunk size, while maintaining a queue of paths left to walk. Upon reaching the chunk size, the accumulated paths are emitted and `loop` is called recursively with the remaining paths left to walk.
+The heart of this implementation is the recursive `loop` function, which uses a single `Sync[F].interruptible` block to accumulate paths up to the specified chunk size, while maintaining a queue of paths left to walk. Upon reaching the chunk size, the accumulated paths are emitted and `loop` is called recursively with the remaining paths left to walk.
 
 Let's check performance:
 
 ```scala
 println(time(walkJustInTime[IO](largeDir, 1024).compile.count.unsafeRunSync()))
-// (6129 milliseconds,488281)
+// (6134 milliseconds,488281)
+
+println(time(walkJustInTime[IO](largeDir, Int.MaxValue).compile.count.unsafeRunSync()))
+// (6001 milliseconds,488281)
 ```
 
+When the specified chunk size is at least the number of paths in the tree, `walkJustInTime` competes with `walkEager`! This is essentially how `walk` is implemented in fs2-io. It supports a number of other features -- link following, cycle detection, etc. But the core algorithm is the same.
+
+## Optimization 5: Avoiding Rework 
+
+Let's return to the `totalSize` operation we looked at earlier:
+
+```scala
+def totalSize(dir: Path): IO[Long] =
+  Files[IO].walk(dir)
+    .evalMap(p => Files[IO].getBasicFileAttributes(p))
+    .map(_.size)
+    .compile.foldMonoid
+```
+
+We went to great lengths to ensure we were doing as much work as possible in each blocking call and yet this program throws much of those performance gains away by calling `getBasicFileAttributes` on each path. Testing performance confirms this:
+
+```scala
+println(time(totalSize(largeDir).unsafeRunSync()))
+// (17487 milliseconds,21874944)
+```
+
+Recall that the implementation of `walkJustInTime` (and hence, the implementation of `Files[F].walk`) read the attributes of each file during the traversal. We just need a way to expose those attributes along with each path and we can void nearly half a million additional blocking calls. The fs2-io library provides the `walkWithAttributes` method, which returns a `PathInfo` instead of a `Path`, for use cases like this.
+
+```scala
+case class PathInfo(path: Path, attributes: BasicFileAttributes)
+```
+
+```scala
+def totalSizeOptimized(dir: Path): IO[Long] =
+  Files[IO].walkWithAttributes(dir)
+    .map(_.attributes.size)
+    .compile.foldMonoid
+
+println(time(totalSizeOptimized(largeDir).unsafeRunSync()))
+// (6116 milliseconds,21874944)
+```
 
 ## Conclusion
 
+FS2 and Cats Effect go to great lengths to provide high level, compositional, performant APIs. Nonetheless, when performing hundreds of thousands of operations, care must be taken to keep performance acceptable. Throughout this post, we gradually refactored a simple implementation for performance, exploring different evaluation techniques and their impacts on performance. This tour of optimizations is representative of real performance improvements made to fs2-io in response to a reported performance issue.
+
+## Acknowledgements
+
+Thanks to [sven42](https://github.com/sven42) for reporting a [performance issue](https://github.com/typelevel/fs2/issues/3329) with fs2's built-in `walk` operation, which was very similar to `walkSimple` in fs2 3.9. These improvements are included in the 3.10+ release (which as of publication, is not yet available).
+
+Thanks to Daniel Spiewak, Arman Bilge, and Fabio Labella for reviewing the subsequent performance improvements: [3383](https://github.com/typelevel/fs2/pull/3383), [3390](https://github.com/typelevel/fs2/pull/3390), [3392](https://github.com/typelevel/fs2/pull/3392), and [3394](https://github.com/typelevel/fs2/pull/3394).
