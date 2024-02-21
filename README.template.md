@@ -134,7 +134,7 @@ Ouch! Let's compare this to using Java's built in `java.nio.file.Files.walk`:
 println(time(java.nio.file.Files.walk(largeDir.toNioPath).count()))
 ```
 
-About four to five times slower (depending on run to run variance)! Presumably because of the overhead of the Cats Effect interpreter and the number of small, blocking calls we're making. There are 390,625 files in this tree and 97,656 directories. That's 390,625 + 97,656 = 488,281 calls to `getBasicFileAttributes` and 97,656 calls to `list`, totaling 585,937 total blocking calls.
+About four to five times slower (depending on run to run variance)! Presumably because of the overhead of the Cats Effect interpreter and the number of small, blocking calls we're making. There are 390,625 (5^8) files in this tree and 97,656 (5^0 + 5^1 + ... + 5^7) directories. That's 390,625 + 97,656 = 488,281 calls to `getBasicFileAttributes` and 97,656 calls to `list`, totaling 585,937 total blocking calls.
 
 What can we do to improve this? Let's take a look at some options.
 
