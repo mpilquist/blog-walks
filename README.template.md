@@ -207,7 +207,7 @@ def walkEager[F[_]: Sync](start: Path): Stream[F, Path] =
   Stream.eval(doWalk).flatMap(Stream.chunk)
 ```
 
-The implementation wraps the call to `walkFileTree` with `Sync[F].interruptible`, allowing cancellation of the fiber that executes the walk. The `FileVisitor` simply enqueus files and directories while checking the `Thread.interrupted()` flag.
+The implementation wraps the call to `walkFileTree` with `Sync[F].interruptible`, allowing cancellation of the fiber that executes the walk. The `FileVisitor` simply enqueues files and directories while checking the `Thread.interrupted()` flag.
 
 This performs fairly well:
 
@@ -215,11 +215,11 @@ This performs fairly well:
 println(time(walkEager[IO](largeDir).compile.count.unsafeRunSync()))
 ```
 
-Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront, before emitting anything.
+Despite the performance, this implementation isn't sufficient for general use. We'd like an implementation that balances performance with lazy evaluation -- performing some file system operations and then yielding control to down-stream processing, instead of performing all file system operations upfront before emitting anything.
 
 ## Optimization 3: Using j.n.f.Files.walkFileTree lazily
 
-The `walkFileTree` operation doesn't allow us to suspend the traversal after we've accumulated some results. The best we can do is to block on enqueuing until our down-stream processing is ready for more elements. We can implement this by introducing concurrency. The general idea is to create a `fs2.concurrent.Channel` and return a `Stream[F, Path]` based on the elements sent to that channel. While down-stream pulls on that stream, concurrently evaluate the walk sending a chunk of paths to the channel as they are accumulated.
+The `walkFileTree` operation doesn't allow us to suspend the traversal after we've accumulated some results. The best we can do is block on enqueuing until our down-stream processing is ready for more elements. We can implement this by introducing concurrency. The general idea is to create a `fs2.concurrent.Channel` and return a `Stream[F, Path]` based on the elements sent to that channel. While down-stream pulls on that stream, concurrently evaluate the walk sending a chunk of paths to the channel as they are accumulated.
 
 ```scala mdoc
 import cats.effect.Async
